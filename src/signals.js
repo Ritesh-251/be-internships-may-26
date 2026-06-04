@@ -1,44 +1,25 @@
 import { insertSignal, getByIdemKey, listSignals } from './db.js';
 import { checkAndConsume } from './rateLimit.js';
 
-// ---------------------------------------------------------------------------
-// Retry helper with exponential backoff + jitter
-// ---------------------------------------------------------------------------
-
 /**
- * Retry `fn` up to `maxAttempts` times on transient errors.
- * SQLITE_CONSTRAINT errors are re-thrown immediately (no point retrying).
- * Back-off formula: 2^attempt * 50ms + random jitter [0, 30)ms.
- *
- * @template T
- * @param {() => T} fn
- * @param {number}  maxAttempts
- * @returns {Promise<T>}
+ * Retry fn up to maxAttempts times on transient errors.
+ * Back-off: 2^attempt * 50ms + jitter [0, 30)ms.
+ * Constraint errors are re-thrown immediately — they are permanent, not transient.
  */
 async function withRetry(fn, maxAttempts = 3) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      return fn(); // better-sqlite3 is synchronous
+      return fn();
     } catch (err) {
-      // Unique-constraint violations are not transient — bail immediately.
-      if (
+      const isConstraint =
         err.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
-        err.code === 'SQLITE_CONSTRAINT'
-      ) {
-        throw err;
-      }
-      // Final attempt — rethrow so the caller sees the error.
-      if (attempt === maxAttempts - 1) throw err;
-      // Wait with exponential backoff + jitter before next attempt.
+        err.code === 'SQLITE_CONSTRAINT';
+      if (isConstraint || attempt === maxAttempts - 1) throw err;
       const backoff = Math.pow(2, attempt) * 50 + Math.random() * 30;
       await new Promise((r) => setTimeout(r, backoff));
     }
   }
 }
-
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
 
 function nowMs() {
   return Date.now();
@@ -47,28 +28,23 @@ function nowMs() {
 /**
  * POST /v1/signals
  *
- * Idempotency approach — atomic, race-condition safe:
- *   Always attempt INSERT directly (no pre-flight SELECT).
- *   If two concurrent requests carry the same Idempotency-Key, exactly one
- *   INSERT wins; the other hits SQLITE_CONSTRAINT and falls back to SELECT.
- *   Both callers receive the same stored record.
+ * Idempotency: always INSERT first, catch SQLITE_CONSTRAINT, then SELECT.
+ * This eliminates the check-then-insert race — two concurrent requests with
+ * the same key will both resolve to the same stored record.
  */
 export async function postSignal(req, reply) {
   const idem = req.headers['idempotency-key'] || null;
   const { userId, type, payload } = req.body || {};
 
-  // Validate body.
   if (!userId || !type || typeof payload === 'undefined') {
     return reply.code(400).send({ error: 'invalid_body' });
   }
 
-  // Rate limit check.
   const { ok, remaining, resetMs } = checkAndConsume(userId, nowMs());
   if (!ok) {
     return reply.code(429).send({ error: 'rate_limited', remaining, resetMs });
   }
 
-  // Attempt atomic insert with retry on transient DB failures.
   const t = nowMs();
   try {
     const info = await withRetry(() =>
@@ -83,7 +59,6 @@ export async function postSignal(req, reply) {
       createdAt: t,
     });
   } catch (e) {
-    // UNIQUE constraint → idempotency hit; fetch and return the existing record.
     if (
       (e.code === 'SQLITE_CONSTRAINT_UNIQUE' || e.code === 'SQLITE_CONSTRAINT') &&
       idem
@@ -96,15 +71,12 @@ export async function postSignal(req, reply) {
         return reply.code(503).send({ error: 'db_unavailable' });
       }
     }
-    // Transient failure exhausted all retries.
     req.log.error({ err: e, ctx: 'insertSignal' });
     return reply.code(503).send({ error: 'db_unavailable' });
   }
 }
 
-/**
- * GET /v1/signals?userId=...&limit=...
- */
+/** GET /v1/signals?userId=...&limit=... */
 export async function getSignals(req, reply) {
   const { userId, limit = 20 } = req.query || {};
   if (!userId) return reply.code(400).send({ error: 'missing_userId' });
