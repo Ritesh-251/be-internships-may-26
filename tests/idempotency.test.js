@@ -37,6 +37,8 @@ test('idempotency is safe under concurrent requests', async () => {
       PORT: '9093',
       DATABASE_URL: './data/test_idem_concurrent.db',
       DB_FAIL_RATE: '0',
+      // Set high enough so rate limiting never interferes with this idempotency test.
+      RATE_LIMIT_PER_MIN: '20',
     },
   });
   await wait(600);
