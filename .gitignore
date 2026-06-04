@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+
+# SQLite databases (runtime data, not source)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
